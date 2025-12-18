@@ -14,8 +14,8 @@ This solution uses Fireworks AI's vision-language model to directly process docu
 
 ### Local Installation
 ```
-git clone <your-repo>
-cd kyc-poc
+git clone https://github.com/amanzoni1/kyc-identity-verification-poc.git
+cd kyc-identity-verification-poc
 
 python -m venv venv
 source venv/bin/activate    # On macOS/Linux
@@ -35,7 +35,7 @@ streamlit run app.py
 
 Open http://localhost:8501 in your browser.
 
-### Alternative: Run with Docker (Recommended for reproducibility)
+### Alternative: Run with Docker
 ```
 docker build -t kyc-poc .
 
@@ -109,5 +109,17 @@ The assignment explicitly asked for documentation of design choices and their tr
 - **Token Usage**: ~900 prompt + ~250 completion tokens per document.
 - **Estimated Cost**: ~$0.0002–0.0003 per document (based on current Fireworks pricing).
 
+## Sample Outputs
+
+Below are screenshots from processing one of the provided sample documents (a Driver's License).
+
+### Driver's License Upload
+![Driver's License Upload](screenshots/up.png)
+
+### Driver's License Metrics
+![PDriver's License Metrics](screenshots/met.png)
+
+### Driver's License Output
+![Driver's License 1 Output and Validation](screenshots/out.png)
 
 Thank you for the opportunity!
