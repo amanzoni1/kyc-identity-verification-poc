@@ -1,0 +1,284 @@
+import json
+import base64
+from io import BytesIO
+from datetime import datetime
+from typing import Optional, Dict, Any
+
+import streamlit as st
+from PIL import Image
+from pydantic import BaseModel, Field, field_validator, computed_field
+from fireworks.client import Fireworks
+
+
+# CONFIG
+client = Fireworks()
+
+MODEL = "accounts/fireworks/models/qwen3-vl-30b-a3b-instruct"
+
+PROMPT = """
+You are an expert identity document extractor.
+Extract all visible identity fields from the image.
+Return ONLY valid JSON using these keys:
+
+{
+  "document_type": "Driver's License" or "Passport" or "ID Card" or "Unknown" or null,
+  "full_name": string or null,
+  "first_name": string or null, Include middle names or initials in 'first_name' if present
+  "last_name": string or null,
+  "date_of_birth": "YYYY-MM-DD" or null,
+  "gender": string or null,
+  "nationality": string or null,
+  "document_number": string or null,
+  "issue_date": "YYYY-MM-DD" or null,
+  "expiry_date": "YYYY-MM-DD" or null,
+  "issuing_country": string or null,
+  "address": string or null,
+  "confidence_score": float between 0.0 (low certainty) and 1.0 (high certainty) - based on overall image quality, text legibility, and how clearly fields are readable,
+  "other_fields": {any additional relevant fields as key-value strings, or empty object}
+}
+
+Use null when unknown.
+"""
+
+
+# IMAGE PREPROCESSING
+def resize_image(image_bytes: bytes, max_size: int = 1024) -> str:
+    img = Image.open(BytesIO(image_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img.thumbnail((max_size, max_size))
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# PYDANTIC MODEL
+class KYCExtraction(BaseModel):
+    document_type: Optional[str] = Field(None, description="Driver's License, Passport, etc.")
+    first_name: str = Field(default=None, description="ALL given names/middle names exactly as they appear")
+    last_name: Optional[str] = None
+    date_of_birth: Optional[str] = None  # YYYY-MM-DD
+    gender: Optional[str] = None
+    nationality: Optional[str] = None
+    document_number: Optional[str] = None
+    issue_date: Optional[str] = None
+    expiry_date: Optional[str] = None
+    issuing_country: Optional[str] = None
+    address: Optional[str] = None
+    confidence_score: Optional[float] = Field(default=0.0, ge=0.0, le=1.0)
+    other_fields: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("date_of_birth", "issue_date", "expiry_date", mode="before")
+    @classmethod
+    def normalize_dates(cls, v):
+        if not v:
+            return None
+        formats = ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y")
+        for fmt in formats:
+            try:
+                return datetime.strptime(v.strip(), fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return None
+
+    @computed_field
+    @property
+    def expiry_valid(self) -> bool:
+        today = datetime.now()
+        exp = self.expiry_date
+        if exp is None:
+            return False
+        try:
+            return datetime.strptime(exp, "%Y-%m-%d") > today
+        except ValueError:
+            return False
+
+    @computed_field
+    @property
+    def full_name(self) -> Optional[str]:
+        if self.first_name and self.last_name:
+            return f"{self.first_name} {self.last_name}".strip().title()
+        return None
+
+
+# POST-PROCESSING
+def post_process(raw: Dict) -> Dict:
+    try:
+        extraction = KYCExtraction(**raw)
+    except Exception as e:
+        st.warning(f"Pydantic validation errors: {e}")
+        safe_data = {k: v for k, v in raw.items() if k in KYCExtraction.model_fields}
+        extraction = KYCExtraction(**safe_data)
+
+    data = extraction.model_dump()
+
+    # Text normalization
+    def normalize_text(s: Optional[str]) -> Optional[str]:
+        if not s:
+            return None
+        return " ".join(s.split()).strip().title()
+
+    def normalize_address(s: Optional[str]) -> Optional[str]:
+        if not s:
+            return None
+        cleaned = ", ".join(line.strip() for line in str(s).splitlines() if line.strip())
+        return cleaned.title()
+
+    doc_type = data.get("document_type")
+    data["document_type"] = doc_type.strip() if isinstance(doc_type, str) else "Unknown"
+    data["first_name"] = normalize_text(data.get("first_name"))
+    data["last_name"] = normalize_text(data.get("last_name"))
+    data["gender"] = data.get("gender").upper().strip() if data.get("gender") else None
+    data["nationality"] = normalize_text(data.get("nationality"))
+    data["issuing_country"] = data.get("issuing_country").upper().strip() if data.get("issuing_country") else None
+    data["address"] = normalize_address(data.get("address"))
+
+    # Clean other_fields lightly
+    for k, v in data.get("other_fields", {}).items():
+        if isinstance(v, str):
+            data["other_fields"][k] = " ".join(v.split()).strip()
+
+    return data
+
+
+# KYC VALIDATION
+def validate_extraction(data: Dict) -> Dict:
+    issues = []
+    warnings = []
+
+    # Critical: core identifiers
+    if not data.get("document_number"):
+        issues.append("Missing document number")
+    if not data.get("first_name") and not data.get("last_name") and not data.get("full_name"):
+        issues.append("Missing name information")
+    if not data.get("date_of_birth"):
+        issues.append("Missing date of birth")
+    if not data.get("expiry_valid", False):
+        issues.append("Document expired")
+
+    # Warnings: anomalies / low quality
+    if data.get("date_of_birth"):
+        try:
+            age = (datetime.now() - datetime.strptime(data["date_of_birth"], "%Y-%m-%d")).days // 365
+            if age < 16 or age > 100:
+                warnings.append(f"Unusual age ({age} years)")
+        except (ValueError, TypeError) as e:
+            warnings.append(f"Invalid date of birth format")
+
+    if data.get("confidence_score", 1.0) < 0.7:
+        warnings.append(f"Low model confidence ({data['confidence_score']:.2f}) – recommend manual review")
+
+    validation = {
+        "status": "APPROVED" if not issues else "REJECTED",
+        "critical_issues": issues or None,
+        "warnings": warnings or None,
+    }
+
+    return validation
+
+
+# STREAMLIT UI
+st.title("KYC Identity Verification PoC")
+
+uploaded = st.file_uploader("Upload document", type=["jpg", "jpeg", "png"])
+
+if uploaded:
+    bytes_data = uploaded.read()
+    st.image(bytes_data, caption="Uploaded Document", width=350)
+
+    if st.button("Analyze Document", type="primary"):
+        with st.spinner("Processing document with Fireworks AI..."):
+            try:
+                b64 = resize_image(bytes_data)
+                image_url = f"data:image/jpeg;base64,{b64}"
+
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": PROMPT},
+                                {"type": "image_url", "image_url": {"url": image_url}}
+                            ]
+                        }
+                    ],
+                    temperature=0.0,
+                    top_p=0.95,
+                    max_tokens=1024,
+                    response_format={"type": "json_object"},
+                    perf_metrics_in_response=True,
+                )
+
+                raw_content = response.choices[0].message.content.strip()
+
+                try:
+                    raw_data = json.loads(raw_content)
+                except json.JSONDecodeError:
+                    st.error("Failed to parse model output as JSON.")
+                    st.code(raw_content)
+                    st.stop()
+
+                # Process and validate
+                cleaned = post_process(raw_data)
+                cleaned["kyc_validation"] = validate_extraction(cleaned)
+
+            except Exception as e:
+                st.error(f"API call failed: {str(e)}")
+                st.info("This might be due to rate limits, network issues, or invalid API key.")
+                st.stop()
+
+        st.success("Analysis Complete!")
+
+        # Performance metrics
+        with st.expander("Performance & Token Usage Details", expanded=False):
+            if hasattr(response, "usage") and response.usage:
+                st.write("**Token Usage**")
+                st.write(f"- Prompt tokens: {response.usage.prompt_tokens}")
+                st.write(f"- Completion tokens: {response.usage.completion_tokens or 'N/A'}")
+                st.write(f"- Total tokens: {response.usage.total_tokens}")
+
+            if hasattr(response, "perf_metrics") and response.perf_metrics:
+                perf = response.perf_metrics
+                st.write("**Latency Metrics**")
+                ttft = perf.get("server-time-to-first-token")
+                if ttft:
+                    st.write(f"- Time to first token: {float(ttft):.3f}s")
+                processing = perf.get("server-processing-time")
+                if processing:
+                    st.write(f"- Total server processing: {float(processing):.3f}s")
+
+
+        # Results and KYC verdict
+        st.markdown("### Output")
+        st.json(cleaned)
+
+        validation = cleaned["kyc_validation"]
+        status = validation["status"]
+
+        if status == "APPROVED":
+            st.success("**KYC VERDICT: APPROVED**")
+        else:
+            st.error("**KYC VERDICT: REJECTED**")
+
+        if validation.get("critical_issues"):
+            st.markdown("#### Critical Issues (blocking approval)")
+            for issue in validation["critical_issues"]:
+                st.error(f"- {issue}")
+
+        if validation.get("warnings"):
+            st.markdown("#### Warnings (non-blocking)")
+            for warning in validation["warnings"]:
+                st.warning(f"- {warning}")
+
+        if not validation.get("critical_issues") and not validation.get("warnings"):
+            st.success("No issues or warnings detected.")
+
+        # Confidence
+        conf = cleaned.get("confidence_score", 0.0)
+        if conf >= 0.9:
+            st.success(f"High model confidence: {conf:.2f}")
+        elif conf >= 0.7:
+            st.info(f"Moderate model confidence: {conf:.2f}")
+        else:
+            st.warning(f"Low model confidence: {conf:.2f}")
