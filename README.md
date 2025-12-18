@@ -13,7 +13,7 @@ This solution uses Fireworks AI's vision-language model to directly process docu
 - Fireworks AI account and API key (create at https://fireworks.ai/)
 
 ### Local Installation
-```
+```bash
 git clone https://github.com/amanzoni1/kyc-identity-verification-poc.git
 cd kyc-identity-verification-poc
 
@@ -29,14 +29,14 @@ export FIREWORKS_API_KEY="your_key_here"
 ```
 
 ### Run the App
-```
+```bash
 streamlit run app.py
 ```
 
 Open http://localhost:8501 in your browser.
 
 ### Alternative: Run with Docker
-```
+```bash
 docker build -t kyc-poc .
 
 docker run -p 8501:8501 -e FIREWORKS_API_KEY="your_key_here" kyc-poc
